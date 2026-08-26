@@ -14,6 +14,9 @@ Streamlit app untuk generate **laporan harian TLC** dari backup chat WhatsApp gr
 
 - ✅ Upload ZIP backup chat (max 200MB)
 - ✅ Deteksi otomatis semua tanggal yang tersedia di chat
+- ✅ **2 mode parsing:**
+  - 🤖 **LLM (DeepSeek)** — ekstraksi paling presisi, tahan variasi format chat. API key dari [platform.deepseek.com](https://platform.deepseek.com) (isi di sidebar atau env `DEEPSEEK_API_KEY`). Hasil di-cache per tanggal, jadi ganti cabang/filter tidak memanggil API ulang.
+  - ⚡ **Regex cepat** — gratis & instan tanpa internet
 - ✅ Filter cabang (PWO, CXP, KBM, BJN — bisa pilih)
 - ✅ Ringkasan TLC + Eskalasi per cabang
 - ✅ Detail per item (AWB, Chat Pengirim, Ket, Client, Kendala, Butuh Bantuan)
@@ -23,7 +26,8 @@ Streamlit app untuk generate **laporan harian TLC** dari backup chat WhatsApp gr
 
 ```
 app.py           # Streamlit app utama
-parser.py        # Parser backup chat (TLC blocks + eskalasi + tracking tanggal)
+parser.py        # Parser regex (TLC blocks + eskalasi + tracking tanggal)
+llm_parser.py    # Ekstraksi via DeepSeek (mode LLM)
 docx_report.py   # Generator DOCX
 requirements.txt # Dependencies
 ```
@@ -33,5 +37,10 @@ requirements.txt # Dependencies
 ```bash
 python -m venv venv
 ./venv/bin/pip install -r requirements.txt
+
+# Opsional: set API key DeepSeek agar tidak perlu isi di sidebar tiap kali
+export DEEPSEEK_API_KEY=sk-...
+
 ./venv/bin/streamlit run app.py
 ```
+

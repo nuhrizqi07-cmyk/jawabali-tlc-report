@@ -383,6 +383,41 @@ def available_dates(entries):
     return dates
 
 
+def available_dates_from_text(text):
+    """Scan cepat timestamp saja -> daftar tanggal unik (desc), tanpa parse blok."""
+    dates = set()
+    for line in text.splitlines():
+        ts = _parse_ts(line)
+        if ts:
+            dates.add(ts['tanggal'])
+    return sorted(dates, key=_norm_date_key, reverse=True)
+
+
+def messages_for_date(text, tanggal):
+    """Kumpulkan pesan mentah satu tanggal utk dikirim ke LLM.
+
+    Return list[dict]: {'waktu', 'sender', 'body'}. Baris lanjutan
+    (multiline) digabung sebagai pesan tersendiri; isi yang menempel
+    pada baris timestamp juga ikut.
+    """
+    out = []
+    cur = None
+    for line in text.splitlines():
+        ts = _parse_ts(line)
+        if ts:
+            cur = ts if ts['tanggal'] == tanggal else None
+            # konten yang menempel di baris timestamp tetap dikirim
+            if cur is not None and cur['body'].strip():
+                out.append({'waktu': cur['waktu'], 'sender': cur['sender'],
+                            'body': cur['body'].strip()})
+            continue
+        if cur is None:
+            continue
+        out.append({'waktu': cur['waktu'], 'sender': cur['sender'],
+                    'body': line.rstrip()})
+    return out
+
+
 def filter_by(entries, cabangs=None, tanggal=None):
     out = entries
     if tanggal:

@@ -3,5 +3,6 @@ __pycache__/
 *.pyc
 .DS_Store
 .streamlit/secrets.toml
+.env
 test_output_*.docx
 test_*.py

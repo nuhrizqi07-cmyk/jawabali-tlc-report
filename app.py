@@ -3,15 +3,19 @@ Streamlit app: Laporan Harian TLC dari backup chat WhatsApp grup NETWORK JAWABAL
 
 Cara pakai:
 1. Upload ZIP backup WhatsApp (hasil export chat grup)
-2. Pilih tanggal yang tersedia (berdasarkan history di chat)
-3. Lihat ringkasan + detail per cabang (PWO, CXP, KBM, BJN)
-4. Download laporan DOCX
+2. Pilih metode parsing: LLM (DeepSeek) atau Regex cepat
+3. Pilih tanggal yang tersedia (berdasarkan history di chat)
+4. Lihat ringkasan + detail per cabang (PWO, CXP, KBM, BJN)
+5. Download laporan DOCX
 """
+
+import os
 
 import streamlit as st
 
 import parser
 import docx_report
+import llm_parser
 
 st.set_page_config(page_title="Laporan Harian TLC", page_icon="📦", layout="wide")
 
@@ -30,6 +34,35 @@ with st.sidebar:
     )
 
     st.divider()
+    st.markdown("**Metode parsing**")
+    metode = st.radio(
+        "Metode parsing",
+        ["🤖 LLM (DeepSeek)", "⚡ Regex cepat"],
+        label_visibility="collapsed",
+        help="LLM = ekstraksi paling presisi via DeepSeek API. "
+             "Regex = gratis & instan, tapi kaku terhadap variasi format.",
+    )
+    use_llm = metode.startswith("🤖")
+
+    api_key = ""
+    model = llm_parser.DEFAULT_MODEL
+    if use_llm:
+        api_key = st.text_input(
+            "DeepSeek API Key",
+            value=os.getenv("DEEPSEEK_API_KEY", ""),
+            type="password",
+            help="Dapatkan di platform.deepseek.com — tersimpan hanya di sesi ini.",
+        )
+        model = st.selectbox(
+            "Model",
+            [llm_parser.DEFAULT_MODEL, llm_parser.REASONER_MODEL],
+            format_func=lambda m: (
+                "deepseek-chat (cepat & murah)" if m == llm_parser.DEFAULT_MODEL
+                else "deepseek-reasoner (paling teliti)"
+            ),
+        )
+
+    st.divider()
     st.markdown("**Cabang yang dilaporkan**")
     cabang_pilihan = st.multiselect(
         "Pilih cabang",
@@ -40,10 +73,13 @@ with st.sidebar:
         st.warning("Pilih minimal 1 cabang.")
 
 # ---------- State ----------
-if "entries" not in st.session_state:
-    st.session_state.entries = None
-if "dates" not in st.session_state:
-    st.session_state.dates = []
+for _k, _v in {
+    "raw_text": None,
+    "entries": None,
+    "dates": [],
+    "llm_cache": {},
+}.items():
+    st.session_state.setdefault(_k, _v)
 
 # ---------- Main ----------
 if uploaded is None:
@@ -54,63 +90,112 @@ if uploaded is None:
     )
     st.stop()
 
-# Parse kalau file baru / belum diparse
+# Baca ZIP sekali -> teks mentah + daftar tanggal (scan cepat, tanpa parse blok)
 key = f"{uploaded.name}:{uploaded.size}"
-if st.session_state.entries is None or st.session_state.get("upload_key") != key:
+if st.session_state.raw_text is None or st.session_state.get("upload_key") != key:
     with st.spinner("Memproses backup chat (bisa ±5 detik untuk file besar)..."):
         try:
             text = parser.load_zip_bytes(uploaded.getvalue())
-            entries = parser.parse_text(text)
-            st.session_state.entries = entries
-            st.session_state.dates = parser.available_dates(entries)
+            st.session_state.raw_text = text
+            st.session_state.dates = parser.available_dates_from_text(text)
+            st.session_state.entries = None
+            st.session_state.llm_cache = {}
             st.session_state.upload_key = key
         except Exception as exc:
             st.error(f"Gagal membaca ZIP: {exc}")
             st.stop()
 
-entries = st.session_state.entries
+raw_text = st.session_state.raw_text
 dates = st.session_state.dates
 
 if not dates:
     st.error("Tidak ada pesan ber-timestamp ditemukan di chat ini.")
     st.stop()
 
-# ---------- Info ringkas ----------
-col1, col2, col3 = st.columns(3)
-col1.metric("Total entry TLC", f"{sum(1 for e in entries if e['tipe']=='tlc'):,}")
-col2.metric("Total eskalasi", f"{sum(1 for e in entries if e['tipe']=='eskalasi'):,}")
-col3.metric("Hari aktif", f"{len(dates)}")
-
-st.divider()
+if use_llm and not api_key:
+    st.warning(
+        "🔑 Masukkan **DeepSeek API Key** di sidebar untuk mode LLM "
+        "(atau set env `DEEPSEEK_API_KEY`). Atau ganti ke **Regex cepat**."
+    )
+    st.stop()
 
 # ---------- Pilih tanggal ----------
 st.subheader("📅 Pilih Tanggal")
-default_idx = 0  # tanggal terbaru
 col_a, col_b = st.columns([2, 1])
 with col_a:
     tanggal = st.selectbox(
         "Tanggal tersedia (dari history chat):",
         dates,
-        index=default_idx,
+        index=0,  # tanggal terbaru
         format_func=lambda d: f"{d}  ({docx_report._fmt_tanggal(d)})",
     )
 with col_b:
     st.caption("")
     if st.button("🔄 Parse ulang ZIP", use_container_width=True):
         st.session_state.entries = None
+        st.session_state.llm_cache = {}
         st.rerun()
 
 if not cabang_pilihan:
     st.stop()
 
-# ---------- Filter ----------
-items = parser.filter_by(entries, cabangs=cabang_pilihan, tanggal=tanggal)
+# ---------- Ekstraksi item ----------
+items = []
+llm_info = ""
+
+if use_llm:
+    ckey = f"{st.session_state.upload_key}|{tanggal}|{model}"
+    if ckey not in st.session_state.llm_cache:
+        msgs = parser.messages_for_date(raw_text, tanggal)
+        if not msgs:
+            st.error(f"Tidak ada pesan pada {tanggal} di chat ini.")
+            st.stop()
+        with st.status(f"🤖 DeepSeek ({model}) mengekstrak {len(msgs)} pesan…") as status:
+            prog = st.progress(0.0, text="Mengirim ke API…")
+            try:
+                def _cb(i, n):
+                    prog.progress(i / n, text=f"Chunk {i}/{n}")
+
+                day_entries, stats = llm_parser.parse_day(
+                    api_key, tanggal, msgs, model=model, on_progress=_cb,
+                )
+            except llm_parser.LLMParseError as exc:
+                status.update(label="❌ Gagal", state="error")
+                st.error(str(exc))
+                st.stop()
+            status.update(label="✅ Ekstraksi selesai", state="complete")
+        st.session_state.llm_cache[ckey] = (day_entries, stats)
+
+    day_entries, stats = st.session_state.llm_cache[ckey]
+    items = parser.filter_by(day_entries, cabangs=cabang_pilihan)
+    pt, ct = stats.get('prompt_tokens') or 0, stats.get('completion_tokens') or 0
+    llm_info = (
+        f"· 🤖 {model}: {pt:,} token in / {ct:,} token out "
+        f"(cache per tanggal)"
+    )
+else:
+    if st.session_state.entries is None:
+        with st.spinner("Memproses backup chat (bisa ±5 detik untuk file besar)..."):
+            st.session_state.entries = parser.parse_text(raw_text)
+    items = parser.filter_by(
+        st.session_state.entries, cabangs=cabang_pilihan, tanggal=tanggal,
+    )
+
 n_tlc = sum(1 for e in items if e['tipe'] == 'tlc')
 n_esc = sum(1 for e in items if e['tipe'] == 'eskalasi')
 
+# ---------- Info ringkas ----------
+col1, col2, col3 = st.columns(3)
+col1.metric("TLC hari ini", f"{n_tlc:,}")
+col2.metric("Eskalasi hari ini", f"{n_esc:,}")
+col3.metric("Hari aktif", f"{len(dates)}")
+
+st.divider()
+
 # ---------- Ringkasan ----------
 st.subheader(f"📊 Ringkasan {docx_report._fmt_tanggal(tanggal)}")
-st.caption(f"{len(items)} item ditemukan ({n_tlc} TLC, {n_esc} eskalasi) untuk cabang terpilih.")
+st.caption(f"{len(items)} item ({n_tlc} TLC, {n_esc} eskalasi) "
+           f"untuk cabang terpilih {llm_info}")
 
 if items:
     import pandas as pd
@@ -185,4 +270,6 @@ else:
 
 # ---------- Footer ----------
 st.divider()
-st.caption("Dibuat otomatis dengan Streamlit · Sumber: backup chat WhatsApp grup NETWORK JAWABALI")
+sumber = "DeepSeek LLM" if use_llm else "regex parser"
+st.caption(f"Dibuat otomatis dengan Streamlit · Sumber: backup chat WhatsApp "
+           f"grup NETWORK JAWABALI · Parsing: {sumber}")
