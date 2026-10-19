@@ -28,15 +28,17 @@ OPENROUTER_SITE_URL = os.getenv(
     "https://jawabali-tlc-report.streamlit.app",
 )
 OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Laporan Harian TLC")
-OPENROUTER_DEFAULT_MODEL = "google/gemini-flash-1.5"
+OPENROUTER_DEFAULT_MODEL = "google/gemini-2.5-flash-lite"
+OPENROUTER_FALLBACK_MODEL = "openai/gpt-4.1-nano"
 
-# Kurasi model OpenRouter: murah, cepat, dan mampu mengikuti instruksi ekstraksi JSON
+# Model yang sudah diverifikasi ada di OpenRouter dan lolos tes ekstraksi JSON.
+# Diurutkan dari yang paling cocok untuk flow ini: murah, cepat, dan patuh format.
 OPENROUTER_MODELS = [
-    {"id": "google/gemini-flash-1.5", "name": "Gemini Flash 1.5 (murah & cepat)"},
-    {"id": "openai/gpt-4o-mini", "name": "GPT-4o mini (murah & cepat)"},
-    {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3 (murah & cepat)"},
-    {"id": "meta-llama/llama-3.1-8b-instruct", "name": "Llama 3.1 8B (sangat murah)"},
-    {"id": "qwen/qwen-2.5-7b-instruct", "name": "Qwen 2.5 7B (sangat murah)"},
+    {"id": "google/gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite (paling cocok)"},
+    {"id": "openai/gpt-4.1-nano", "name": "GPT-4.1 nano (murah, khusus ekstraksi)"},
+    {"id": "openai/gpt-4o-mini", "name": "GPT-4o mini (murah & stabil)"},
+    {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3 (sama dengan mode DeepSeek)"},
+    {"id": "google/gemini-2.5-flash", "name": "Gemini 2.5 Flash (lebih teliti)"},
 ]
 
 MAX_INPUT_CHARS = 40_000     # per request (aman utk context 64k token)
@@ -155,7 +157,11 @@ def _render_messages(messages):
 
 def _extract_json(text):
     """Ambil objek JSON pertama dari balasan model (tahan code fence)."""
-    text = text.strip()
+    if text is None:
+        raise LLMParseError('Balasan LLM kosong.')
+    text = str(text).strip()
+    if not text:
+        raise LLMParseError('Balasan LLM kosong.')
     fence = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.S)
     if fence:
         text = fence.group(1).strip()
@@ -260,32 +266,44 @@ def parse_day(api_key, tanggal, messages, provider='deepseek', model=DEFAULT_MOD
             f"({len(ch)} pesan). Ekstrak semua entry TLC & eskalasi.\n\n"
             f"=== CHAT ===\n{_render_messages(ch)}\n=== AKHIR CHAT ==="
         )
-        # fallback bila model terpilih tidak mendukung response_format json_object
+        # Model mati (404) langsung diganti. JSON mode yang ditolak dicoba ulang tanpa itu.
+        if provider == 'openrouter':
+            attempts = [
+                (model, True),
+                (model, False),
+                (OPENROUTER_DEFAULT_MODEL, True),
+                (OPENROUTER_FALLBACK_MODEL, True),
+            ]
+        else:
+            attempts = [
+                (model, model != REASONER_MODEL),
+                (DEFAULT_MODEL, True),
+                (DEFAULT_MODEL, False),
+            ]
+        seen = set()
+        plan = []
+        for item in attempts:
+            if item not in seen:
+                seen.add(item)
+                plan.append(item)
+
         data, st_ = None, None
-        for attempt in range(3):
-            payload_model = model
-            use_json_mode = True
-            if attempt >= 1:
-                if provider == 'openrouter':
-                    # retry: matikan json_mode; model terpilih dulu, lalu default
-                    use_json_mode = False
-                    payload_model = model if attempt == 1 else OPENROUTER_DEFAULT_MODEL
-                else:
-                    # DeepSeek: fallback ke default model yang mendukung json_object
-                    payload_model = DEFAULT_MODEL
-            elif provider == 'deepseek' and model == REASONER_MODEL:
-                # Reasoner kadang menolak json_object
-                use_json_mode = False
+        last_exc = None
+        for idx, (payload_model, use_json_mode) in enumerate(plan):
             try:
                 data, st_ = _request(api_key, provider, payload_model, tanggal, body,
                                      json_mode=use_json_mode)
                 break
             except (LLMParseError, requests.RequestException) as exc:
-                if attempt == 2:
-                    label = 'OpenRouter' if provider == 'openrouter' else 'DeepSeek'
-                    raise LLMParseError(
-                        f'Gagal memanggil {label} setelah 3 percobaan: {exc}'
-                    )
+                last_exc = exc
+                dead_model = 'No endpoints found' in str(exc) or ' 404' in str(exc)
+                if dead_model:
+                    continue
+                if idx == len(plan) - 1:
+                    break
+        if data is None:
+            label = 'OpenRouter' if provider == 'openrouter' else 'DeepSeek'
+            raise LLMParseError(f'Gagal memanggil {label}: {last_exc}')
         entries_raw = data.get('entries', []) if isinstance(data, dict) else []
         if not isinstance(entries_raw, list):
             entries_raw = []
@@ -337,8 +355,11 @@ def _request(api_key, provider, model, tanggal, body, json_mode=True):
         raise LLMParseError(f'{label} API {resp.status_code}: {resp.text[:300]}')
     data = resp.json()
     try:
-        content = data['choices'][0]['message']['content']
-    except (KeyError, IndexError):
+        message = data['choices'][0]['message'] or {}
+        content = message.get('content')
+        if not content:
+            content = message.get('reasoning') or message.get('reasoning_content')
+    except (KeyError, IndexError, AttributeError):
         raise LLMParseError(f'Respon tak terduga dari {label}: {str(data)[:300]}')
     usage = data.get('usage') or {}
     stats = {

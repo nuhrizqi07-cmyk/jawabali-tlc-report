@@ -179,7 +179,7 @@ if use_llm:
         if not msgs:
             st.error(f"Tidak ada pesan pada {tanggal} di chat ini.")
             st.stop()
-        with st.status(f"🤖 DeepSeek ({model}) mengekstrak {len(msgs)} pesan…") as status:
+        with st.status(f"🤖 {provider_label} ({model}) mengekstrak {len(msgs)} pesan…") as status:
             prog = st.progress(0.0, text="Mengirim ke API…")
             try:
                 def _cb(i, n):
