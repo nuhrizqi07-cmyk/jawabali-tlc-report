@@ -37,30 +37,58 @@ with st.sidebar:
     st.markdown("**Metode parsing**")
     metode = st.radio(
         "Metode parsing",
-        ["🤖 LLM (DeepSeek)", "⚡ Regex cepat"],
+        ["🤖 LLM", "⚡ Regex cepat"],
         label_visibility="collapsed",
-        help="LLM = ekstraksi paling presisi via DeepSeek API. "
+        help="LLM = ekstraksi presisi via API. "
              "Regex = gratis & instan, tapi kaku terhadap variasi format.",
     )
     use_llm = metode.startswith("🤖")
 
+    provider = "deepseek"
+    provider_label = "DeepSeek"
     api_key = ""
     model = llm_parser.DEFAULT_MODEL
     if use_llm:
-        api_key = st.text_input(
-            "DeepSeek API Key",
-            value=os.getenv("DEEPSEEK_API_KEY", ""),
-            type="password",
-            help="Dapatkan di platform.deepseek.com — tersimpan hanya di sesi ini.",
-        )
-        model = st.selectbox(
-            "Model",
-            [llm_parser.DEFAULT_MODEL, llm_parser.REASONER_MODEL],
-            format_func=lambda m: (
-                "deepseek-chat (cepat & murah)" if m == llm_parser.DEFAULT_MODEL
-                else "deepseek-reasoner (paling teliti)"
-            ),
-        )
+        provider = st.radio(
+            "Provider LLM",
+            ["DeepSeek", "OpenRouter"],
+            horizontal=True,
+            help="Pilih provider API. OpenRouter bisa dipakai bila tidak punya API DeepSeek.",
+        ).lower()
+        provider_label = "OpenRouter" if provider == "openrouter" else "DeepSeek"
+
+        if provider == "deepseek":
+            api_key = st.text_input(
+                "DeepSeek API Key",
+                value=os.getenv("DEEPSEEK_API_KEY", ""),
+                type="password",
+                placeholder="sk-...",
+                help="Dapatkan di platform.deepseek.com — tersimpan hanya di sesi ini.",
+            )
+            model = st.selectbox(
+                "Model",
+                [llm_parser.DEFAULT_MODEL, llm_parser.REASONER_MODEL],
+                format_func=lambda m: (
+                    "deepseek-chat (cepat & murah)" if m == llm_parser.DEFAULT_MODEL
+                    else "deepseek-reasoner (paling teliti)"
+                ),
+            )
+        else:
+            api_key = st.text_input(
+                "OpenRouter API Key",
+                value=os.getenv("OPENROUTER_API_KEY", ""),
+                type="password",
+                placeholder="sk-or-v1-...",
+                help="Dapatkan di openrouter.ai — tersimpan hanya di sesi ini.",
+            )
+            model_ids = [m["id"] for m in llm_parser.OPENROUTER_MODELS]
+            model_names = {m["id"]: m["name"] for m in llm_parser.OPENROUTER_MODELS}
+            model = st.selectbox(
+                "Model",
+                model_ids,
+                index=0,
+                format_func=lambda m: model_names.get(m, m),
+            )
 
     st.divider()
     st.markdown("**Cabang yang dilaporkan**")
@@ -113,9 +141,10 @@ if not dates:
     st.stop()
 
 if use_llm and not api_key:
+    env_name = "OPENROUTER_API_KEY" if provider == "openrouter" else "DEEPSEEK_API_KEY"
     st.warning(
-        "🔑 Masukkan **DeepSeek API Key** di sidebar untuk mode LLM "
-        "(atau set env `DEEPSEEK_API_KEY`). Atau ganti ke **Regex cepat**."
+        f"🔑 Masukkan **{provider_label} API Key** di sidebar untuk mode LLM "
+        f"(atau set env `{env_name}`). Atau ganti ke **Regex cepat**."
     )
     st.stop()
 
@@ -144,7 +173,7 @@ items = []
 llm_info = ""
 
 if use_llm:
-    ckey = f"{st.session_state.upload_key}|{tanggal}|{model}"
+    ckey = f"{st.session_state.upload_key}|{tanggal}|{provider}|{model}"
     if ckey not in st.session_state.llm_cache:
         msgs = parser.messages_for_date(raw_text, tanggal)
         if not msgs:
@@ -157,7 +186,7 @@ if use_llm:
                     prog.progress(i / n, text=f"Chunk {i}/{n}")
 
                 day_entries, stats = llm_parser.parse_day(
-                    api_key, tanggal, msgs, model=model, on_progress=_cb,
+                    api_key, tanggal, msgs, provider=provider, model=model, on_progress=_cb,
                 )
             except llm_parser.LLMParseError as exc:
                 status.update(label="❌ Gagal", state="error")
@@ -170,7 +199,7 @@ if use_llm:
     items = parser.filter_by(day_entries, cabangs=cabang_pilihan)
     pt, ct = stats.get('prompt_tokens') or 0, stats.get('completion_tokens') or 0
     llm_info = (
-        f"· 🤖 {model}: {pt:,} token in / {ct:,} token out "
+        f"· 🤖 {provider_label} {model}: {pt:,} token in / {ct:,} token out "
         f"(cache per tanggal)"
     )
 else:
@@ -270,6 +299,6 @@ else:
 
 # ---------- Footer ----------
 st.divider()
-sumber = "DeepSeek LLM" if use_llm else "regex parser"
+sumber = f"{provider_label} LLM" if use_llm else "regex parser"
 st.caption(f"Dibuat otomatis dengan Streamlit · Sumber: backup chat WhatsApp "
            f"grup NETWORK JAWABALI · Parsing: {sumber}")

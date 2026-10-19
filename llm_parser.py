@@ -16,9 +16,28 @@ import re
 
 import requests
 
-API_URL = "https://api.deepseek.com/chat/completions"
+# DeepSeek
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 DEFAULT_MODEL = "deepseek-chat"          # V3 — cepat & murah, cocok ekstraksi
 REASONER_MODEL = "deepseek-reasoner"     # R1 — lebih teliti, lebih lambat
+
+# OpenRouter
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+OPENROUTER_SITE_URL = os.getenv(
+    "OPENROUTER_SITE_URL",
+    "https://jawabali-tlc-report.streamlit.app",
+)
+OPENROUTER_APP_NAME = os.getenv("OPENROUTER_APP_NAME", "Laporan Harian TLC")
+OPENROUTER_DEFAULT_MODEL = "google/gemini-flash-1.5"
+
+# Kurasi model OpenRouter: murah, cepat, dan mampu mengikuti instruksi ekstraksi JSON
+OPENROUTER_MODELS = [
+    {"id": "google/gemini-flash-1.5", "name": "Gemini Flash 1.5 (murah & cepat)"},
+    {"id": "openai/gpt-4o-mini", "name": "GPT-4o mini (murah & cepat)"},
+    {"id": "deepseek/deepseek-chat", "name": "DeepSeek V3 (murah & cepat)"},
+    {"id": "meta-llama/llama-3.1-8b-instruct", "name": "Llama 3.1 8B (sangat murah)"},
+    {"id": "qwen/qwen-2.5-7b-instruct", "name": "Qwen 2.5 7B (sangat murah)"},
+]
 
 MAX_INPUT_CHARS = 40_000     # per request (aman utk context 64k token)
 MAX_OUTPUT_TOKENS = 8_192    # batas output deepseek-chat
@@ -89,21 +108,23 @@ class LLMParseError(Exception):
     pass
 
 
-def _get_key(api_key=None):
+def _get_key(provider, api_key=None):
     if api_key:
         return api_key.strip()
-    key = os.getenv('DEEPSEEK_API_KEY', '')
+    env_var = 'OPENROUTER_API_KEY' if provider == 'openrouter' else 'DEEPSEEK_API_KEY'
+    key = os.getenv(env_var, '')
     if key:
         return key.strip()
     try:
         import streamlit as st
-        if 'DEEPSEEK_API_KEY' in st.secrets:
-            return str(st.secrets['DEEPSEEK_API_KEY']).strip()
+        if env_var in st.secrets:
+            return str(st.secrets[env_var]).strip()
     except Exception:
         pass
+    label = 'OpenRouter' if provider == 'openrouter' else 'DeepSeek'
     raise LLMParseError(
-        'DeepSeek API key tidak ditemukan. Isi di sidebar atau set '
-        'env DEEPSEEK_API_KEY.'
+        f'{label} API key tidak ditemukan. Isi di sidebar atau set '
+        f'env {env_var}.'
     )
 
 
@@ -221,12 +242,12 @@ def _finalize_entry(e, tanggal):
     return out
 
 
-def parse_day(api_key, tanggal, messages, model=DEFAULT_MODEL, on_progress=None):
-    """Ekstrak semua entry TLC/eskalasi dari pesan satu tanggal via DeepSeek.
+def parse_day(api_key, tanggal, messages, provider='deepseek', model=DEFAULT_MODEL, on_progress=None):
+    """Ekstrak semua entry TLC/eskalasi dari pesan satu tanggal via DeepSeek/OpenRouter.
 
     Return (entries, stats) — stats berisi total pemakaian token.
     """
-    api_key = _get_key(api_key)
+    api_key = _get_key(provider, api_key)
     messages = messages or []
     chunks = _chunk_messages(messages)
 
@@ -239,23 +260,31 @@ def parse_day(api_key, tanggal, messages, model=DEFAULT_MODEL, on_progress=None)
             f"({len(ch)} pesan). Ekstrak semua entry TLC & eskalasi.\n\n"
             f"=== CHAT ===\n{_render_messages(ch)}\n=== AKHIR CHAT ==="
         )
-        # fallback: reasoner kadang menolak response_format json_object
-        use_json_mode = model == DEFAULT_MODEL
+        # fallback bila model terpilih tidak mendukung response_format json_object
         data, st_ = None, None
         for attempt in range(3):
             payload_model = model
-            try:
-                if attempt >= 1:
-                    # retry: turunkan ke model default & json mode
+            use_json_mode = True
+            if attempt >= 1:
+                if provider == 'openrouter':
+                    # retry: matikan json_mode; model terpilih dulu, lalu default
+                    use_json_mode = False
+                    payload_model = model if attempt == 1 else OPENROUTER_DEFAULT_MODEL
+                else:
+                    # DeepSeek: fallback ke default model yang mendukung json_object
                     payload_model = DEFAULT_MODEL
-                    use_json_mode = True
-                data, st_ = _request(api_key, payload_model, tanggal, body,
+            elif provider == 'deepseek' and model == REASONER_MODEL:
+                # Reasoner kadang menolak json_object
+                use_json_mode = False
+            try:
+                data, st_ = _request(api_key, provider, payload_model, tanggal, body,
                                      json_mode=use_json_mode)
                 break
             except (LLMParseError, requests.RequestException) as exc:
                 if attempt == 2:
+                    label = 'OpenRouter' if provider == 'openrouter' else 'DeepSeek'
                     raise LLMParseError(
-                        f'Gagal memanggil DeepSeek setelah 3 percobaan: {exc}'
+                        f'Gagal memanggil {label} setelah 3 percobaan: {exc}'
                     )
         entries_raw = data.get('entries', []) if isinstance(data, dict) else []
         if not isinstance(entries_raw, list):
@@ -268,7 +297,22 @@ def parse_day(api_key, tanggal, messages, model=DEFAULT_MODEL, on_progress=None)
     return all_entries, stats
 
 
-def _request(api_key, model, tanggal, body, json_mode=True):
+def _request(api_key, provider, model, tanggal, body, json_mode=True):
+    if provider == 'openrouter':
+        url = OPENROUTER_API_URL
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+            'HTTP-Referer': OPENROUTER_SITE_URL,
+            'X-Title': OPENROUTER_APP_NAME,
+        }
+    else:
+        url = DEEPSEEK_API_URL
+        headers = {
+            'Authorization': f'Bearer {api_key}',
+            'Content-Type': 'application/json',
+        }
+
     payload = {
         'model': model,
         'messages': [
@@ -283,21 +327,19 @@ def _request(api_key, model, tanggal, body, json_mode=True):
     if json_mode:
         payload['response_format'] = {'type': 'json_object'}
     resp = requests.post(
-        API_URL,
-        headers={
-            'Authorization': f'Bearer {api_key}',
-            'Content-Type': 'application/json',
-        },
+        url,
+        headers=headers,
         json=payload,
         timeout=TIMEOUT,
     )
+    label = 'OpenRouter' if provider == 'openrouter' else 'DeepSeek'
     if resp.status_code != 200:
-        raise LLMParseError(f'DeepSeek API {resp.status_code}: {resp.text[:300]}')
+        raise LLMParseError(f'{label} API {resp.status_code}: {resp.text[:300]}')
     data = resp.json()
     try:
         content = data['choices'][0]['message']['content']
     except (KeyError, IndexError):
-        raise LLMParseError(f'Respon tak terduga dari DeepSeek: {str(data)[:300]}')
+        raise LLMParseError(f'Respon tak terduga dari {label}: {str(data)[:300]}')
     usage = data.get('usage') or {}
     stats = {
         'prompt_tokens': usage.get('prompt_tokens'),
